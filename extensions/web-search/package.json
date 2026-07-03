@@ -1,0 +1,14 @@
+{
+  "name": "pi-web-search",
+  "version": "1.0.0",
+  "description": "Web search plugin for pi coding agent using Mojeek",
+  "type": "module",
+  "keywords": ["pi-package", "pi-extension"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}

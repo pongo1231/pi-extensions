@@ -1,0 +1,6 @@
+bin
+npm
+sessions
+auth.json
+settings.json
+.venv*

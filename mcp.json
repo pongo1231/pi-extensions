@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "ghidra": {
+      "type": "local",
+      "command": [
+        "~/.pi/agent/extensions/mcp-ghidra/run-ghidra.sh"
+      ],
+      "enabled": true
+    }
+  }
+}
