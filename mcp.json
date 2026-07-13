@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "ghidra": {
+      "type": "local",
+      "command": ["bash", "./run-ghidra.sh"],
+      "env": {
+        "GHIDRA_MCP_LOG_LEVEL": "WARN"
+      }
+    }
+  }
+}
