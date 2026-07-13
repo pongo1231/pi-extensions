@@ -332,16 +332,18 @@ class McpClient {
 
     this.proc.on("error", (err) => {
       this.dead = true;
-      this.rejectAll(
-        new Error(`MCP "${this.name}" process error: ${err.message}`),
-      );
+      const code = (err as NodeJS.ErrnoException).code;
+      const hint = code === "ENOENT"
+        ? `MCP server "${this.name}" could not be started — "${this.command[0]}" was not found.`
+        : `MCP server "${this.name}" process error: ${err.message}`;
+      this.rejectAll(new Error(hint));
     });
 
     this.proc.on("exit", (code) => {
       this.dead = true;
       if (code !== 0 && code !== null) {
         this.rejectAll(
-          new Error(`MCP "${this.name}" exited with code ${code}`),
+          new Error(`MCP server "${this.name}" stopped (exit code ${code}). Is the backend running?`),
         );
       }
     });
@@ -354,7 +356,11 @@ class McpClient {
     });
 
     // Send initialized notification (no response expected)
-    this.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    try {
+      this.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    } catch {
+      // process already dead — initialize request will have failed too
+    }
   }
 
   async discoverTools(): Promise<McpToolDef[]> {
@@ -490,10 +496,32 @@ function registerMcpTool(
         };
       }
 
-      const result = await client.callTool(
-        toolDef.name,
-        params as Record<string, unknown>,
-      );
+      if (!client.isAlive) {
+        const msg =
+          `MCP server "${serverName}" is not running. ` +
+          `Restart pi or reload with /reload to reconnect.`;
+        return {
+          content: [{ type: "text" as const, text: msg }],
+          details: { server: serverName, tool: toolDef.name, error: "server_dead" },
+        };
+      }
+
+      let result: unknown;
+      try {
+        result = await client.callTool(
+          toolDef.name,
+          params as Record<string, unknown>,
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const msg =
+          `MCP tool "${toolDef.name}" on server "${serverName}" failed: ${message}\n` +
+          `The server may have crashed — try /reload to restart it.`;
+        return {
+          content: [{ type: "text" as const, text: msg }],
+          details: { server: serverName, tool: toolDef.name, error: message },
+        };
+      }
 
       // MCP tools return content as an array of content blocks
       const content = result as {
@@ -579,6 +607,9 @@ export default function (pi: ExtensionAPI) {
 
     if (entries.length === 0) return;
 
+    const loaded: string[] = [];
+    const failed: string[] = [];
+
     for (const [name, serverConfig] of entries) {
       try {
         const client = new McpClient(name, serverConfig, EXTENSION_DIR);
@@ -591,19 +622,22 @@ export default function (pi: ExtensionAPI) {
           registerMcpTool(pi, name, toolDef, client);
         }
 
-        if (tools.length > 0 && ctx.hasUI) {
-          ctx.ui.notify(
-            `MCP "${name}": ${tools.length} tool${tools.length === 1 ? "" : "s"} loaded`,
-            "info",
-          );
-        }
+        loaded.push(name);
       } catch (err) {
-        const message =
-          err instanceof Error ? err.message : "failed to start";
-        if (ctx.hasUI) {
-          ctx.ui.notify(`MCP "${name}": ${message}`, "error");
-        }
+        clients.delete(name);
+        failed.push(name);
       }
+    }
+
+    if (ctx.hasUI && (loaded.length > 0 || failed.length > 0)) {
+      const parts: string[] = [];
+      if (loaded.length > 0) {
+        parts.push(`Loaded: ${loaded.join(", ")}`);
+      }
+      if (failed.length > 0) {
+        parts.push(`Unavailable: ${failed.map((f) => f.replace(/ \[.*\]/, "")).join(", ")}`);
+      }
+      ctx.ui.notify(`MCP Servers ${parts.join(" | ")}`, "info");
     }
   }
 
