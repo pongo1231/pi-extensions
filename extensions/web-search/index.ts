@@ -46,6 +46,11 @@ const MOJEEK_URL = "https://www.mojeek.com/search";
 const DEFAULT_MAX_RESULTS = 10;
 const MAX_RESULTS = 20;
 const CONFIG_FILE_NAME = "web-search.json";
+const MIN_QUERY_LENGTH = 2;
+const MAX_QUERY_LENGTH = 256;
+const MAX_RETRIES = 2;
+const RETRY_DELAY_MS = 1000;
+const RATE_LIMIT_COOLDOWN_MS = 30_000;
 
 // ---------------------------------------------------------------------------
 // Configuration loader
@@ -96,6 +101,28 @@ function stripHtml(html: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Query validation
+// ---------------------------------------------------------------------------
+
+interface ValidationResult {
+  valid: boolean;
+  message?: string;
+}
+
+function validateQuery(query: string): ValidationResult {
+  if (!query || query.trim().length === 0) {
+    return { valid: false, message: "Search query cannot be empty." };
+  }
+  if (query.trim().length < MIN_QUERY_LENGTH) {
+    return { valid: false, message: `Search query is too short (minimum ${MIN_QUERY_LENGTH} characters).` };
+  }
+  if (query.length > MAX_QUERY_LENGTH) {
+    return { valid: false, message: `Search query is too long (maximum ${MAX_QUERY_LENGTH} characters).` };
+  }
+  return { valid: true };
+}
+
+// ---------------------------------------------------------------------------
 // Mojeek search
 // ---------------------------------------------------------------------------
 
@@ -119,6 +146,10 @@ const RE_TITLE = /<a class="title"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/i;
 // From within a result block, extract the snippet
 const RE_SNIPPET = /<p class="s">([\s\S]*?)<\/p>/i;
 
+async function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function searchMojeek(
   query: string,
   count: number,
@@ -126,23 +157,44 @@ async function searchMojeek(
 ): Promise<SearchResult[]> {
   const url = `${MOJEEK_URL}?q=${encodeURIComponent(query)}`;
 
-  const response = await fetch(url, {
-    method: "GET",
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" +
-        " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      Accept: "text/html",
-    },
-    signal,
-  });
+  const headers = {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" +
+      " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    Accept: "text/html",
+  };
 
-  if (!response.ok) {
-    throw new Error(`Mojeek returned HTTP ${response.status} ${response.statusText}`);
+  let lastError: Error | undefined;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    if (signal?.aborted) throw new Error("Search aborted");
+
+    let response: Response;
+    try {
+      response = await fetch(url, { method: "GET", headers, signal });
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      if (attempt < MAX_RETRIES) await sleep(RETRY_DELAY_MS);
+      else throw lastError;
+      continue;
+    }
+
+    if (!response.ok) {
+      lastError = new Error(`Mojeek returned HTTP ${response.status} ${response.statusText}`);
+      if (response.status === 403 || response.status === 429) {
+        if (attempt < MAX_RETRIES) {
+          await sleep(RETRY_DELAY_MS * (attempt + 1));
+          continue;
+        }
+      }
+      throw lastError;
+    }
+
+    const html = await response.text();
+    return parseMojeekResults(html, count);
   }
 
-  const html = await response.text();
-  return parseMojeekResults(html, count);
+  throw lastError ?? new Error("Search failed unexpectedly");
 }
 
 function parseMojeekResults(html: string, count: number): SearchResult[] {
@@ -214,9 +266,21 @@ export default function (pi: ExtensionAPI) {
   // Per-session result cache to avoid repeated API calls
   let queryCache = new Map<string, { results: SearchResult[]; timestamp: number }>();
 
-  // Reset cache on new session
+  // Per-session rate limit tracking — skip API calls during cooldown
+  let lastRateLimitTime = 0;
+
+  function isRateLimited(): boolean {
+    return Date.now() - lastRateLimitTime < RATE_LIMIT_COOLDOWN_MS;
+  }
+
+  function recordRateLimit(): void {
+    lastRateLimitTime = Date.now();
+  }
+
+  // Reset cache + rate limit on new session
   pi.on("session_start", async () => {
     queryCache = new Map();
+    lastRateLimitTime = 0;
   });
 
   // Register the web_search tool
@@ -250,8 +314,22 @@ export default function (pi: ExtensionAPI) {
     }),
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      // Validate query
+      const validation = validateQuery(params.query);
+      if (!validation.valid) {
+        return {
+          content: [{ type: "text" as const, text: validation.message! }],
+          details: {
+            query: params.query,
+            resultCount: 0,
+            results: [],
+            cached: false,
+          } satisfies SearchDetails,
+        };
+      }
+
       const config = loadConfig(ctx);
-      const count = Math.min(params.count ?? config.maxResults, MAX_RESULTS);
+      const count = Math.max(1, Math.min(params.count ?? config.maxResults, MAX_RESULTS));
 
       // Check cache
       const cacheKey = `${params.query}|${count}`;
@@ -273,8 +351,48 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
+      // Check rate limit cooldown before making API call
+      if (isRateLimited()) {
+        const remaining = Math.ceil((RATE_LIMIT_COOLDOWN_MS - (Date.now() - lastRateLimitTime)) / 1000);
+        return {
+          content: [{ type: "text" as const, text: `Search throttled: Mojeek rate limit active. Try again in ${remaining}s.` }],
+          details: {
+            query: params.query,
+            resultCount: 0,
+            results: [],
+            cached: false,
+          } satisfies SearchDetails,
+        };
+      }
+
       // Search via Mojeek
-      const results = await searchMojeek(params.query, count, signal ?? undefined);
+      let results: SearchResult[];
+      try {
+        results = await searchMojeek(params.query, count, signal ?? undefined);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (message.includes("403") || message.includes("429") || message.includes("rate limit")) {
+          recordRateLimit();
+          return {
+            content: [{ type: "text" as const, text: `Search failed: Rate limit exceeded. Please try again in a moment.` }],
+            details: {
+              query: params.query,
+              resultCount: 0,
+              results: [],
+              cached: false,
+            } satisfies SearchDetails,
+          };
+        }
+        return {
+          content: [{ type: "text" as const, text: `Search failed: ${message}` }],
+          details: {
+            query: params.query,
+            resultCount: 0,
+            results: [],
+            cached: false,
+          } satisfies SearchDetails,
+        };
+      }
 
       // Cache results
       queryCache.set(cacheKey, { results, timestamp: Date.now() });
