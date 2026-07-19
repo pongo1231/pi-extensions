@@ -1,6 +1,6 @@
 import {
-  AuthStorage,
   getAgentDir,
+  readStoredCredential,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { readFile } from "node:fs/promises";
@@ -16,7 +16,6 @@ export class ConfigResolver {
   private warnings: string[] = [];
 
   private cachedUrls: string[] = [];
-  private authStorage = AuthStorage.create(join(getAgentDir(), "auth.json"));
   private settingsManager = SettingsManager.create(
     process.cwd(),
     getAgentDir(),
@@ -107,13 +106,20 @@ export class ConfigResolver {
   }
 
   /**
-   * Resolves API key for the provider ID using Pi's AuthStorage
+   * Resolves API key for the provider ID from Pi's auth.json
    */
   async resolveApiKey(providerId: string): Promise<string> {
-    this.authStorage.reload();
-    const apiKey = await this.authStorage.getApiKey(providerId);
+    // Fresh read from disk on every call (replaces the old reload/getApiKey)
+    const credential = readStoredCredential(
+      providerId,
+      join(getAgentDir(), "auth.json"),
+    );
 
-    return apiKey ?? API_KEY_PLACEHOLDER;
+    if (credential?.type === "api_key" && credential.key) {
+      return credential.key;
+    }
+
+    return API_KEY_PLACEHOLDER;
   }
 
   /**

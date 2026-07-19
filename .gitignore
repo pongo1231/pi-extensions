@@ -4,3 +4,4 @@ sessions
 auth.json
 settings.json
 .venv*
+models-store.json
