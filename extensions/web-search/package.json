@@ -1,7 +1,7 @@
 {
   "name": "pi-web-search",
   "version": "1.0.0",
-  "description": "Web search plugin for pi coding agent using Mojeek",
+  "description": "Web search plugin for pi coding agent using DuckDuckGo Lite",
   "type": "module",
   "keywords": ["pi-package", "pi-extension"],
   "pi": {

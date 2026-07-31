@@ -1,7 +1,7 @@
 /**
  * Web Search Plugin for pi
  *
- * Registers a `web_search` tool that searches the web via Mojeek.
+ * Registers a `web_search` tool that searches the web via DuckDuckGo Lite.
  * Works out of the box with zero configuration — no API key needed.
  *
  * Optional config file at ~/.pi/agent/web-search.json:
@@ -42,7 +42,7 @@ interface SearchConfig {
 // Constants
 // ---------------------------------------------------------------------------
 
-const MOJEEK_URL = "https://www.mojeek.com/search";
+const DDG_URL = "https://lite.duckduckgo.com/lite/";
 const DEFAULT_MAX_RESULTS = 10;
 const MAX_RESULTS = 20;
 const CONFIG_FILE_NAME = "web-search.json";
@@ -50,7 +50,6 @@ const MIN_QUERY_LENGTH = 2;
 const MAX_QUERY_LENGTH = 256;
 const MAX_RETRIES = 2;
 const RETRY_DELAY_MS = 1000;
-const RATE_LIMIT_COOLDOWN_MS = 30_000;
 
 // ---------------------------------------------------------------------------
 // Configuration loader
@@ -123,46 +122,29 @@ function validateQuery(query: string): ValidationResult {
 }
 
 // ---------------------------------------------------------------------------
-// Mojeek search
+// DuckDuckGo Lite search
 // ---------------------------------------------------------------------------
 
-// Mojeek results are clean semantic HTML:
-//   <ul class="results-standard">
-//     <li class="r1">
-//       <h2><a class="title" href="...">Title</a></h2>
-//       <p class="s">Snippet text...</p>
-//     </li>
-//   </ul>
+// DuckDuckGo Lite returns simple tabular HTML:
+//   <tr class="result-...">
+//     <td>
+//       <a href="...">Title</a>
+//       <span class="result-snippet">Snippet...</span>
+//     </td>
+//   </tr>
 //
-// No CAPTCHAs, no redirects, no rate limiting. Just works.
-
-// Extract a single result <li> block (class="rN")
-const RE_RESULT_BLOCK =
-  /<li class="r\d+">([\s\S]*?)<\/li>\s*(?:<!--re-->|<!--le-->)/gi;
-
-// From within a result block, extract the title link
-const RE_TITLE = /<a class="title"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/i;
-
-// From within a result block, extract the snippet
-const RE_SNIPPET = /<p class="s">([\s\S]*?)<\/p>/i;
+// No CAPTCHAs, no redirects, no API key needed.
 
 async function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function searchMojeek(
+async function searchDuckDuckGo(
   query: string,
   count: number,
   signal?: AbortSignal,
 ): Promise<SearchResult[]> {
-  const url = `${MOJEEK_URL}?q=${encodeURIComponent(query)}`;
-
-  const headers = {
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" +
-      " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    Accept: "text/html",
-  };
+  const body = new URLSearchParams({ q: query });
 
   let lastError: Error | undefined;
 
@@ -171,7 +153,16 @@ async function searchMojeek(
 
     let response: Response;
     try {
-      response = await fetch(url, { method: "GET", headers, signal });
+      response = await fetch(DDG_URL, {
+        method: "POST",
+        headers: {
+          "User-Agent": "Mozilla/5.0 (compatible; PiAgent/1.0)",
+          "Content-Type": "application/x-www-form-urlencoded",
+          Accept: "text/html",
+        },
+        body: body.toString(),
+        signal,
+      });
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
       if (attempt < MAX_RETRIES) await sleep(RETRY_DELAY_MS);
@@ -180,7 +171,7 @@ async function searchMojeek(
     }
 
     if (!response.ok) {
-      lastError = new Error(`Mojeek returned HTTP ${response.status} ${response.statusText}`);
+      lastError = new Error(`DuckDuckGo returned HTTP ${response.status} ${response.statusText}`);
       if (response.status === 403 || response.status === 429) {
         if (attempt < MAX_RETRIES) {
           await sleep(RETRY_DELAY_MS * (attempt + 1));
@@ -191,38 +182,37 @@ async function searchMojeek(
     }
 
     const html = await response.text();
-    return parseMojeekResults(html, count);
+    return parseDdgResults(html, count);
   }
 
   throw lastError ?? new Error("Search failed unexpectedly");
 }
 
-function parseMojeekResults(html: string, count: number): SearchResult[] {
+function parseDdgResults(html: string, count: number): SearchResult[] {
   const results: SearchResult[] = [];
+  const resultBlocks = html.split("<tr");
 
-  let blockMatch: RegExpExecArray | null;
-  RE_RESULT_BLOCK.lastIndex = 0;
+  for (const block of resultBlocks) {
+    if (results.length >= count) break;
+    if (!block.includes("result-")) continue;
 
-  while (
-    (blockMatch = RE_RESULT_BLOCK.exec(html)) !== null &&
-    results.length < count
-  ) {
-    const block = blockMatch[1]!;
+    // Extract title link
+    const linkMatch = block.match(/<a[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/);
+    if (!linkMatch) continue;
 
-    // Extract title
-    const titleMatch = RE_TITLE.exec(block);
-    if (!titleMatch) continue;
-    const url = titleMatch[1]!;
-    const title = stripHtml(titleMatch[2]!);
+    const url = linkMatch[1]!;
+    const title = stripHtml(linkMatch[2]!);
+    if (!title || !url) continue;
 
     // Extract snippet
-    const snippetMatch = RE_SNIPPET.exec(block);
+    const snippetMatch = block.match(/class="result-snippet">([\s\S]*?)<\/td>/);
     const description = snippetMatch ? stripHtml(snippetMatch[1]!) : "";
 
-    // Skip results that are link clusters (no real snippet)
-    if (url.includes("mojeek.com/search?q=site%3A")) continue;
-
-    results.push({ title, url, description });
+    results.push({
+      title,
+      url: url.startsWith("http") ? url : `https://${url.replace(/^\/+/, "")}`,
+      description,
+    });
   }
 
   return results;
@@ -266,21 +256,9 @@ export default function (pi: ExtensionAPI) {
   // Per-session result cache to avoid repeated API calls
   let queryCache = new Map<string, { results: SearchResult[]; timestamp: number }>();
 
-  // Per-session rate limit tracking — skip API calls during cooldown
-  let lastRateLimitTime = 0;
-
-  function isRateLimited(): boolean {
-    return Date.now() - lastRateLimitTime < RATE_LIMIT_COOLDOWN_MS;
-  }
-
-  function recordRateLimit(): void {
-    lastRateLimitTime = Date.now();
-  }
-
-  // Reset cache + rate limit on new session
+  // Reset cache on new session
   pi.on("session_start", async () => {
     queryCache = new Map();
-    lastRateLimitTime = 0;
   });
 
   // Register the web_search tool
@@ -288,7 +266,7 @@ export default function (pi: ExtensionAPI) {
     name: "web_search",
     label: "Web Search",
     description:
-      "Search the web using Mojeek. No API key required. " +
+      "Search the web using DuckDuckGo. No API key required. " +
       "Returns titles, URLs, and descriptions of search results. " +
       "Use this to find current information, documentation, or answer questions about recent events. " +
       `Results are limited to ${MAX_RESULTS} per query. ` +
@@ -351,28 +329,13 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // Check rate limit cooldown before making API call
-      if (isRateLimited()) {
-        const remaining = Math.ceil((RATE_LIMIT_COOLDOWN_MS - (Date.now() - lastRateLimitTime)) / 1000);
-        return {
-          content: [{ type: "text" as const, text: `Search throttled: Mojeek rate limit active. Try again in ${remaining}s.` }],
-          details: {
-            query: params.query,
-            resultCount: 0,
-            results: [],
-            cached: false,
-          } satisfies SearchDetails,
-        };
-      }
-
-      // Search via Mojeek
+      // Search via DuckDuckGo
       let results: SearchResult[];
       try {
-        results = await searchMojeek(params.query, count, signal ?? undefined);
+        results = await searchDuckDuckGo(params.query, count, signal ?? undefined);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        if (message.includes("403") || message.includes("429") || message.includes("rate limit")) {
-          recordRateLimit();
+        if (message.includes("403") || message.includes("429")) {
           return {
             content: [{ type: "text" as const, text: `Search failed: Rate limit exceeded. Please try again in a moment.` }],
             details: {
